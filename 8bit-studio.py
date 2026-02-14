@@ -18,12 +18,9 @@ class RetroSynth:
         # --- GLOBAL ---
         self.drum_channel = 9 
         self.bit_depth = 16.0 
+        self.note_activity_callback = None  # Für das visuelle Feedback
 
         # --- SETTINGS ---
-        self.melody_vol = 0.5
-        self.waveform = "Pulse" 
-        self.pulse_width = 0.5 
-
         self.kick_vol = 1.0
         self.kick_decay = 0.15 
         self.kick_type = "Triangle" 
@@ -32,6 +29,31 @@ class RetroSynth:
         self.snare_decay = 0.2 
         self.snare_body = 0.5  
         self.snare_type = "White Noise"
+
+        # --- MELODY ---
+        self.channel_settings = {
+            ch: {
+                "volume": 0.5,
+                "waveform": "Pulse",
+                "pulse_width": 0.25,
+
+                # Extra erweiterte modi weil cool
+                "pan": 0.0, # -1 = links, 0 = mitte, +1 = rechts
+
+                "env_enabled": False,
+                "attack": 0.01,
+                "decay": 0.1,
+                "sustain": 0.7,
+                "release": 0.2,
+
+                "pw_enabled": False,
+                "pw_start": 0.25,
+                "pw_stop": 0.5,
+                "pw_bounce": False,
+                "pw_bounce_time": 0.2,
+            }
+            for ch in range(16)
+        }
 
         self.current_sample_index = 0
         self.stream = None
@@ -43,12 +65,15 @@ class RetroSynth:
         with self.lock:
             self.active_notes.clear()
             self.current_sample_index = 0
+            for i in range(16):
+                self.note_activity_callback(i, False)
 
     def generate_chunk(self, frames, current_time_index):
         if frames <= 0: return np.array([])
 
         global_t = (np.arange(frames) + current_time_index) / self.sample_rate
-        mix = np.zeros(frames)
+        mix_left = np.zeros(frames)
+        mix_right = np.zeros(frames)
         
         # Polyphonie Limitierung (Safe Copy)
         if len(self.active_notes) > self.max_polyphony:
@@ -121,42 +146,102 @@ class RetroSynth:
                 wave_data *= self.snare_vol
 
             # --- MELODY ---
-            else:
-                phase = (global_t * freq) % 1.0
-                if self.waveform == "Pulse":
-                    wave_data = np.where(phase < self.pulse_width, 1.0, -1.0)
-                elif self.waveform == "Triangle":
-                    wave_data = 2.0 * np.abs(2.0 * (phase - np.floor(phase + 0.5))) - 1.0
-                elif self.waveform == "Sawtooth":
-                    wave_data = 2.0 * (phase - 0.5)
-                wave_data *= self.melody_vol
+            elif sound_type == 'melody':
+                ch = data.get("channel", 0)
+                cs = self.channel_settings.get(ch, self.channel_settings[0])
 
-            mix += wave_data * data['vel']
+                phase = (global_t * freq) % 1.0
+
+                # Envelope anpassung
+                if cs["env_enabled"]:
+                    a = cs["attack"]
+                    d = cs["decay"]
+                    s = cs["sustain"]
+                    r = cs["release"]
+
+                    env = np.zeros(frames)
+                    for i in range(frames):
+                        dt = 1.0 / self.sample_rate
+
+                        if data['env_phase'] == 'attack':
+                            data['env_level'] += dt / max(0.001, a)
+                            if data['env_level'] >= 1.0:
+                                data['env_level'] = 1.0
+                                data['env_phase'] = 'decay'
+
+                        elif data['env_phase'] == 'decay':
+                            data['env_level'] -= dt * (1.0 - s) / max(0.001, d)
+                            if data['env_level'] <= s:
+                                data['env_level'] = s
+                                data['env_phase'] = 'sustain'
+
+                        elif data['env_phase'] == 'sustain':
+                            data['env_level'] = s
+
+                        env[i] = data['env_level']
+
+                else:
+                    env = np.ones(frames)
+
+                # Pulsbreitenanpassung
+                pw = cs["pulse_width"]
+
+                if cs["pw_enabled"]:
+                    if cs["pw_bounce"]:
+                        # Zwichen start und stop über zeit welchseln
+                        T = max(0.001, cs["pw_bounce_time"])
+                        cycle = (global_t / T) % 2.0
+                        cycle = np.where(cycle > 1.0, 2.0 - cycle, cycle)
+                        pw = cs["pw_start"] + cycle * (cs["pw_stop"] - cs["pw_start"])
+                    else:
+                        # Linearverlauf
+                        note_duration = max(0.001, np.max(note_t))  # division durch 0 verhindern
+                        pct = np.clip(note_t / note_duration, 0.0, 1.0)
+                        pw = cs["pw_start"] + pct * (cs["pw_stop"] - cs["pw_start"])
+
+                if cs["waveform"] == "Pulse":
+                    wave_data = np.where(phase < pw, 1.0, -1.0)
+                elif cs["waveform"] == "Triangle":
+                    wave_data = 2.0 * np.abs(2.0 * (phase - np.floor(phase + 0.5))) - 1.0
+                else:  # Sawtooth
+                    wave_data = 2.0 * (phase - 0.5)
+
+                wave_data *= cs["volume"]
+                wave_data *= env
+
+            # Seitenabgleich
+            left_gain = np.cos((cs["pan"] + 1) * np.pi/4)
+            right_gain = np.sin((cs["pan"] + 1) * np.pi/4)
+
+            mix_left  += wave_data * left_gain * data['vel']
+            mix_right += wave_data * right_gain * data['vel']
 
         # Normalisierung
         if note_count > 0:
-            mix = mix / (note_count ** 0.55)
+            mix_left = mix_left / (note_count ** 0.55)
+            mix_right = mix_right / (note_count ** 0.55)
 
         # Bitcrusher
         if self.bit_depth < 128:
-            mix = np.round(mix * self.bit_depth) / self.bit_depth
+            mix_left = np.round(mix_left * self.bit_depth) / self.bit_depth
+            mix_right = np.round(mix_right * self.bit_depth) / self.bit_depth
 
-        return mix * 0.5
+        return mix_left, mix_right
 
     def audio_callback(self, outdata, frames, time_info, status):
         if status: print(status)
         try:
             # Live Playback ist fehlertolerant
-            mix = self.generate_chunk(frames, self.current_sample_index)
+            mix_left, mix_right = self.generate_chunk(frames, self.current_sample_index)
             self.current_sample_index += frames
-            outdata[:] = mix.reshape(-1, 1)
+            outdata[:] = np.column_stack([mix_left, mix_right])
         except Exception:
             # Im Zweifel Stille ausgeben statt abstürzen
-            outdata[:] = np.zeros((frames, 1))
+            outdata[:] = np.zeros((frames, 2))
 
     def start_stream(self):
         self.stop_stream()
-        self.stream = sd.OutputStream(channels=1, samplerate=self.sample_rate, callback=self.audio_callback)
+        self.stream = sd.OutputStream(channels=2, samplerate=self.sample_rate, callback=self.audio_callback)
         self.stream.start()
 
     def stop_stream(self):
@@ -177,19 +262,32 @@ class RetroSynth:
 
         with self.lock:
             self.active_notes[note] = {
-                'freq': self.get_freq(note), 
+                'channel': channel,
+                'freq': self.get_freq(note),
                 'vel': vol,
                 'start_time': self.current_sample_index,
-                'type': s_type
+                'type': s_type,
+
+                # Envelope parameter
+                'env_phase': "attack",
+                'env_level': 0.0,
+
+                # Plusbreitenautomatisierung
+                'pw_val': self.channel_settings[channel]["pulse_width"],
+                'pw_direction': 1, # nur beim bounce an
             }
+        if self.note_activity_callback:
+            self.note_activity_callback(channel, True)
 
     def note_off(self, note):
-        with self.lock:
-            if note in self.active_notes:
-                # Drums lassen wir ausklingen (Envelope), Melodie löschen wir
-                if self.active_notes[note]['type'] == 'melody':
-                    del self.active_notes[note]
-    
+        channel = self.active_notes[note]['channel'] if note in self.active_notes else None
+        if note in self.active_notes:
+            if self.active_notes[note]['type'] == 'melody' and self.active_notes[note]['env_phase'] == "attack":
+                del self.active_notes[note]
+        if self.note_activity_callback and channel is not None:
+            still_active = any(n['channel']==channel for n in self.active_notes.values())
+            self.note_activity_callback(channel, still_active)
+
     def all_notes_off(self):
         with self.lock:
             self.active_notes.clear()
@@ -198,8 +296,8 @@ class RetroSynth:
 class RetroMidiApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("8-BIT STUDIO: FINAL FIX")
-        self.root.geometry("600x680")
+        self.root.title("8-BIT STUDIO: FINAL MIX") # mal gucken ob das auffällt
+        self.root.geometry("600x858")
         
         self.bg = "#1e1e1e" 
         self.fg = "#00ffcc" 
@@ -216,6 +314,8 @@ class RetroMidiApp:
         self.style.map("TButton", background=[("active", self.acc)], foreground=[("active", "white")])
 
         self.synth = RetroSynth()
+        self.channel_active = {ch: False for ch in range(16)}
+        self.synth.note_activity_callback = self.on_channel_activity
         self.midi_file = None
         self.is_playing = False
         self.total_messages = 0
@@ -232,6 +332,8 @@ class RetroMidiApp:
         self.lbl_status = ttk.Label(top_frame, text="READY", foreground="#888")
         self.lbl_status.pack(side=tk.RIGHT, padx=10)
 
+        self.style.configure("Active.TButton", background="#0f0", foreground="#000")
+
         ctrl_frame = ttk.LabelFrame(main, text=" CONTROLS ", padding=10)
         ctrl_frame.pack(fill=tk.X, pady=5)
         
@@ -240,6 +342,20 @@ class RetroMidiApp:
         
         btn_box = ttk.Frame(ctrl_frame)
         btn_box.pack()
+        
+        var_sample_rate = tk.StringVar(value=self.synth.sample_rate)
+
+        sample_rate_box = ttk.Combobox(
+            btn_box, 
+            values=[48000, 44100, 22050, 11025], 
+            textvariable=var_sample_rate, 
+            state="readonly"
+        )
+        sample_rate_box.pack(side=tk.LEFT, padx=5)
+        sample_rate_box.bind("<<ComboboxSelected>>", 
+            lambda e: setattr(self.synth, "sample_rate", int(var_sample_rate.get()))
+        )
+
         ttk.Button(btn_box, text="LOAD MIDI", command=self.load_midi).pack(side=tk.LEFT, padx=5)
         self.btn_play = ttk.Button(btn_box, text="PLAY", command=self.toggle_play, state=tk.NORMAL)
         self.btn_play.pack(side=tk.LEFT, padx=5)
@@ -260,12 +376,21 @@ class RetroMidiApp:
         inst_frame = ttk.Frame(main)
         inst_frame.pack(fill=tk.BOTH, expand=True, pady=10)
         
-        # MELODY
-        f_mel = ttk.LabelFrame(inst_frame, text=" MELODY ", padding=5)
-        f_mel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
-        self.create_slider(f_mel, "Volume", 0, 1.0, 0.5, lambda v: setattr(self.synth, 'melody_vol', float(v)))
-        self.create_combo(f_mel, "Wave", ["Pulse", "Triangle", "Sawtooth"], "Pulse", lambda e,v: setattr(self.synth, 'waveform', v.get()))
-        self.create_slider(f_mel, "Width", 0.01, 0.5, 0.25, lambda v: setattr(self.synth, 'pulse_width', float(v)))
+        # CHANNELS (1–16 except drums)
+        f_ch = ttk.LabelFrame(inst_frame, text=" CHANNELS ", padding=5)
+        f_ch.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+
+        self.channel_buttons = []
+        for i in range(16):
+            if i == self.synth.drum_channel:
+                continue
+            btn = ttk.Button(
+                f_ch,
+                text=f"Channel {i+1}",
+                command=lambda ch=i: self.open_channel_settings(ch)
+            )
+            btn.pack(fill=tk.X, pady=2)
+            self.channel_buttons.append(btn)
 
         # KICK
         f_kick = ttk.LabelFrame(inst_frame, text=" KICK ", padding=5)
@@ -289,6 +414,114 @@ class RetroMidiApp:
         var = tk.StringVar(value=default)
         cb = ttk.Combobox(parent, textvariable=var, values=values, state="readonly"); cb.pack(fill=tk.X)
         cb.bind("<<ComboboxSelected>>", lambda e: callback(e, var))
+
+    def open_channel_settings(self, ch):
+        win = tk.Toplevel(self.root)
+        win.title(f"Channel {ch+1} Settings")
+        win.geometry("300x504")
+        win.configure(bg=self.bg)
+
+        cs = self.synth.channel_settings[ch]
+
+        # --- Volume ---
+        ttk.Label(win, text="Volume").pack(anchor="w")
+        vol = ttk.Scale(win, from_=0.0, to=1.5)
+        vol.set(cs["volume"])
+        vol.pack(fill=tk.X)
+        vol.configure(command=lambda v: cs.__setitem__("volume", float(v)))
+
+        # --- Waveform ---
+        ttk.Label(win, text="Waveform").pack(anchor="w", pady=(10,0))
+        var_wave = tk.StringVar(value=cs["waveform"])
+        box = ttk.Combobox(win, values=["Pulse","Triangle","Sawtooth"], textvariable=var_wave, state="readonly")
+        box.pack(fill=tk.X)
+        box.bind("<<ComboboxSelected>>",
+                 lambda e: (cs.__setitem__("waveform", var_wave.get()), pulse_slider.configure(state="normal" if var_wave.get()=="Pulse" else "disabled")))
+
+        # --- Pulse Width ---
+        ttk.Label(win, text="Pulse Width").pack(anchor="w", pady=(10,0))
+        pulse_slider = ttk.Scale(win, from_=0.01, to=0.5)
+        pulse_slider.set(cs["pulse_width"])
+        pulse_slider.pack(fill=tk.X)
+        pulse_slider.configure(
+            command=lambda v: cs.__setitem__("pulse_width", float(v)),
+            state="normal" if cs["waveform"] == "Pulse" else "disabled"
+        )
+        
+        # --- PAN ---
+        ttk.Label(win, text="Pan (L↔R)").pack(anchor="w", pady=(10,0))
+        pan = ttk.Scale(win, from_=-1.0, to=1.0)
+        pan.set(cs["pan"])
+        pan.pack(fill=tk.X)
+        pan.configure(command=lambda v: cs.__setitem__("pan", float(v)))
+
+
+        # --- Envelope Enable ---
+        env_var = tk.BooleanVar(value=cs["env_enabled"])
+        env_chk = ttk.Checkbutton(win, text="Enable Envelope", variable=env_var)
+        env_chk.pack(anchor="w", pady=(10,0))
+        env_chk.config(command=lambda: cs.__setitem__("env_enabled", env_var.get()))
+
+        # ADSR sliders
+        def add_env_slider(label, key, minv, maxv):
+            ttk.Label(win, text=label).pack(anchor="w")
+            s = ttk.Scale(win, from_=minv, to=maxv)
+            s.set(cs[key])
+            s.pack(fill=tk.X)
+            s.configure(command=lambda v: cs.__setitem__(key, float(v)))
+            return s
+
+        attack  = add_env_slider("Attack", "attack", 0.001, 1.0)
+        decay   = add_env_slider("Decay", "decay", 0.001, 1.0)
+        sustain = add_env_slider("Sustain", "sustain", 0.0, 1.0)
+        release = add_env_slider("Release", "release", 0.001, 1.5)
+
+
+        # --- Pulse Width Automation ---
+        pw_enabled = tk.BooleanVar(value=cs["pw_enabled"])
+        pw_chk = ttk.Checkbutton(win, text="Enable PW Automation", variable=pw_enabled)
+        pw_chk.pack(anchor="w", pady=(10,0))
+        pw_chk.config(command=lambda: cs.__setitem__("pw_enabled", pw_enabled.get()))
+
+        # PW Start
+        ttk.Label(win, text="PW Start").pack(anchor="w")
+        pw_s = ttk.Scale(win, from_=0.01, to=0.99)
+        pw_s.set(cs["pw_start"])
+        pw_s.pack(fill=tk.X)
+        pw_s.configure(command=lambda v: cs.__setitem__("pw_start", float(v)))
+
+        # PW Stop
+        ttk.Label(win, text="PW Stop").pack(anchor="w")
+        pw_e = ttk.Scale(win, from_=0.01, to=0.99)
+        pw_e.set(cs["pw_stop"])
+        pw_e.pack(fill=tk.X)
+        pw_e.configure(command=lambda v: cs.__setitem__("pw_stop", float(v)))
+
+        # PW Bounce
+        pw_bounce = tk.BooleanVar(value=cs["pw_bounce"])
+        chk_bounce = ttk.Checkbutton(win, text="PW Bounce", variable=pw_bounce)
+        chk_bounce.pack(anchor="w")
+        chk_bounce.config(command=lambda: cs.__setitem__("pw_bounce", pw_bounce.get()))
+
+        # PW Bounce Time
+        ttk.Label(win, text="PW Bounce Time").pack(anchor="w")
+        pw_bt = ttk.Scale(win, from_=0.05, to=1.0)
+        pw_bt.set(cs["pw_bounce_time"])
+        pw_bt.pack(fill=tk.X)
+        pw_bt.configure(command=lambda v: cs.__setitem__("pw_bounce_time", float(v)))
+
+    def on_channel_activity(self, ch, active):
+        # Da TCL/TK nicht selbst threaded ist, Synth von UI separieren
+        self.root.after(0, lambda: self._update_channel_button(ch, active))
+
+    def _update_channel_button(self, ch, active):
+        self.channel_active[ch] = active
+        btn_index = ch if ch < self.synth.drum_channel else ch-1
+        btn = self.channel_buttons[btn_index]
+        if active:
+            btn.config(style="Active.TButton")
+        else:
+            btn.config(style="TButton")
 
     def load_midi(self):
         path = filedialog.askopenfilename(filetypes=[("MIDI", "*.mid"), ("All Files", "*.*")])
@@ -357,33 +590,27 @@ class RetroMidiApp:
             buffer = []
             print(f"Starte Export nach: {filename}")
             
-            # METHODE 2: Über die Datei iterieren (Sicherste Methode für Zeit)
-            # Mido wandelt 'time' hier automatisch in Sekunden um (Delta)
-            
             count = 0
-            # Wir iterieren über das File Objekt, nicht über tracks
-            # Das simuliert play() ohne warten
             
             for msg in self.midi_file:
                 count += 1
                 if count % 200 == 0:
-                     # GUI Update (Thread Safe Wrapper)
-                     p = (count / self.total_messages) * 100
-                     print(f"Export: {int(p)}%...")
-                     self.root.after(0, lambda txt=f"EXP: {int(p)}%": self.lbl_status.config(text=txt))
+                    p = (count / self.total_messages) * 100
+                    print(f"Export: {int(p)}%...")
+                    self.root.after(0, lambda txt=f"EXP: {int(p)}%": self.lbl_status.config(text=txt))
 
-                # Delta berechnen (msg.time ist Sekunden bei iterieren über MidiFile)
                 delta = int(msg.time * self.synth.sample_rate)
                 
                 if delta > 0:
-                    chunk = self.synth.generate_chunk(delta, self.synth.current_sample_index)
-                    if len(chunk) > 0:
-                        buffer.append(chunk)
+                    # Stereo ausgabe
+                    chunk_l, chunk_r = self.synth.generate_chunk(delta, self.synth.current_sample_index)
+                    if len(chunk_l) > 0 and len(chunk_r) > 0:
+                        stereo_chunk = np.column_stack([chunk_l, chunk_r])
+                        buffer.append(stereo_chunk)
                         self.synth.current_sample_index += delta
                 
                 ch = getattr(msg, 'channel', -1)
                 
-                # Try-Except um defekte MIDI Events zu ignorieren
                 try:
                     if msg.type == 'note_on':
                         if msg.velocity > 0: 
@@ -392,26 +619,29 @@ class RetroMidiApp:
                             self.synth.note_off(msg.note)
                     elif msg.type == 'note_off': 
                         self.synth.note_off(msg.note)
-                except Exception as e:
-                    pass # Fehler bei einzelner Note ignorieren
+                except Exception:
+                    pass
 
             # Letzter Ausklang
             print("Rendering Ausklang...")
-            buffer.append(self.synth.generate_chunk(int(self.synth.sample_rate), self.synth.current_sample_index))
+            chunk_l, chunk_r = self.synth.generate_chunk(int(self.synth.sample_rate), self.synth.current_sample_index)
+            stereo_chunk = np.column_stack([chunk_l, chunk_r])
+            buffer.append(stereo_chunk)
             
             if len(buffer) == 0:
                 raise Exception("Keine Audio-Daten generiert! Ist die MIDI Datei leer?")
 
             print("Zusammenfügen...")
-            full = np.concatenate(buffer)
+            full = np.concatenate(buffer, axis=0)  # (samples, 2)
             
             print("Normalisieren...")
             m = np.max(np.abs(full))
-            if m > 0: full = full/m * 0.95
+            if m > 0:
+                full = full / m * 0.95
             
             print("Speichern...")
             with wave.open(filename, 'w') as f:
-                f.setnchannels(1)
+                f.setnchannels(2) # 2 weil Stereo
                 f.setsampwidth(2)
                 f.setframerate(self.synth.sample_rate)
                 f.writeframes((full * 32767).astype(np.int16).tobytes())
